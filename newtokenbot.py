@@ -40,17 +40,31 @@ BACKLOG   = os.environ.get("ANNOUNCE_BACKLOG", "0").strip() == "1"
 
 # ---------- JSON-RPC ----------
 # Some RPC providers (Cloudflare-fronted) reject the default "Python-urllib"
-# User-Agent with 403 — send a normal one.
+# User-Agent with 403 — send a normal one. Retry on 429/5xx with backoff so a
+# rate limit or a hiccup never crashes the bot.
 UA = "Mozilla/5.0 (compatible; SwogeBot/1.0; +https://swoleeswoge.dog)"
-def rpc(method, params):
+def rpc(method, params, tries=6):
     body = json.dumps({"jsonrpc":"2.0","id":1,"method":method,"params":params}).encode()
-    req  = urllib.request.Request(RPC, data=body,
-        headers={"content-type":"application/json", "accept":"application/json", "user-agent":UA})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        out = json.loads(r.read())
-    if out.get("error"):
-        raise RuntimeError(out["error"])
-    return out.get("result")
+    last = None
+    for attempt in range(tries):
+        try:
+            req = urllib.request.Request(RPC, data=body,
+                headers={"content-type":"application/json", "accept":"application/json", "user-agent":UA})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                out = json.loads(r.read())
+            if out.get("error"):
+                raise RuntimeError(out["error"])
+            return out.get("result")
+        except urllib.error.HTTPError as e:
+            last = e
+            if e.code in (429, 500, 502, 503, 504):
+                time.sleep(min(30, 2 ** attempt))   # 1,2,4,8,16,30 — backs off on rate limit
+                continue
+            raise
+        except Exception as e:                       # network hiccup / timeout
+            last = e
+            time.sleep(min(30, 2 ** attempt))
+    raise last
 
 def hx(n):         return hex(n)
 def to_int(h):     return int(h, 16)
@@ -187,13 +201,21 @@ def announce(l):
 # ---------- main loop ----------
 def main():
     print("SWOGE FUN new-token bot starting…")
-    tip = to_int(rpc("eth_blockNumber", []))
+    # resilient startup: keep retrying instead of crashing (so Railway doesn't restart-storm)
+    tip = None
+    while tip is None:
+        try:
+            tip = to_int(rpc("eth_blockNumber", []))
+        except Exception as e:
+            print("startup: RPC not ready ({}), retrying in 15s…".format(e)); time.sleep(15)
     if BACKLOG:
-        # announce the last few existing tokens once (scan a recent window)
-        start = max(0, tip - 500000)
-        recent = launches_in_range(start, tip)[-5:]
-        print("posting {} backlog launches".format(len(recent)))
-        for l in recent: announce(l); time.sleep(1)
+        try:
+            start = max(0, tip - 500000)
+            recent = launches_in_range(start, tip)[-5:]
+            print("posting {} backlog launches".format(len(recent)))
+            for l in recent: announce(l); time.sleep(1)
+        except Exception as e:
+            print("backlog skipped:", e)
     last = tip
     print("Ready. Watching from block", last)
     while True:
