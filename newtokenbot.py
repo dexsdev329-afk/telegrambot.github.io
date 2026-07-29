@@ -39,9 +39,13 @@ POLL      = int(os.environ.get("POLL_SECONDS", "20"))
 BACKLOG   = os.environ.get("ANNOUNCE_BACKLOG", "0").strip() == "1"
 
 # ---------- JSON-RPC ----------
+# Some RPC providers (Cloudflare-fronted) reject the default "Python-urllib"
+# User-Agent with 403 — send a normal one.
+UA = "Mozilla/5.0 (compatible; SwogeBot/1.0; +https://swoleeswoge.dog)"
 def rpc(method, params):
     body = json.dumps({"jsonrpc":"2.0","id":1,"method":method,"params":params}).encode()
-    req  = urllib.request.Request(RPC, data=body, headers={"content-type":"application/json"})
+    req  = urllib.request.Request(RPC, data=body,
+        headers={"content-type":"application/json", "accept":"application/json", "user-agent":UA})
     with urllib.request.urlopen(req, timeout=30) as r:
         out = json.loads(r.read())
     if out.get("error"):
@@ -111,6 +115,7 @@ def launches_in_range(frm, to):
 # ---------- Telegram ----------
 TG = "https://api.telegram.org/bot{}".format(BOT_TOKEN)
 def tg_call(method, data, headers):
+    headers = dict(headers); headers.setdefault("user-agent", UA)
     req = urllib.request.Request(TG + "/" + method, data=data, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=25) as r: r.read()
