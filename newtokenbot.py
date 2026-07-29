@@ -31,6 +31,14 @@ META     = "0x4b61405e238df570af60c371625a1b234a1e8ab96f3670bc6f67c87b179d2799" 
 SEL_NAME   = "0x06fdde03"
 SEL_SYMBOL = "0x95d89b41"
 
+# ---------- $SWOGE burn watching ----------
+SWOGE_TOKEN   = "0x8a166Fb41Cd659a0a43396272FF73973Ce29F817"   # Swole Doge ($SWOGE)
+DEAD          = "0x000000000000000000000000000000000000dEaD"
+TRANSFER      = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"  # Transfer(address,address,uint256)
+SEL_BALANCEOF = "0x70a08231"
+SEL_SUPPLY    = "0x18160ddd"
+import urllib.parse
+
 # ---------- user config ----------
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
@@ -139,23 +147,29 @@ def tg_call(method, data, headers):
     except Exception as e:
         print("Telegram error:", e); return False
 
-def tg_message(text):
+def tg_message(text, reply_markup=None):
     if not BOT_TOKEN or not CHAT_ID:
         print("[dry-run]\n" + text + "\n"); return
-    body = json.dumps({"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML",
-                       "disable_web_page_preview": True}).encode()
-    tg_call("sendMessage", body, {"content-type": "application/json"})
+    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+    if reply_markup: payload["reply_markup"] = reply_markup
+    tg_call("sendMessage", json.dumps(payload).encode(), {"content-type": "application/json"})
 
-def tg_photo(img_bytes, caption):
+def tg_photo(img_bytes, caption, reply_markup=None):
     boundary = "----swoge" + str(len(img_bytes))
     def field(name, val):
         return ("--{}\r\nContent-Disposition: form-data; name=\"{}\"\r\n\r\n{}\r\n"
                 .format(boundary, name, val)).encode()
     body  = field("chat_id", str(CHAT_ID)) + field("caption", caption) + field("parse_mode", "HTML")
+    if reply_markup: body += field("reply_markup", json.dumps(reply_markup))
     body += ("--{}\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"logo\"\r\n"
              "Content-Type: application/octet-stream\r\n\r\n".format(boundary)).encode()
     body += img_bytes + b"\r\n" + ("--{}--\r\n".format(boundary)).encode()
     return tg_call("sendPhoto", body, {"content-type": "multipart/form-data; boundary=" + boundary})
+
+def tweet_button(l):
+    text = "🚀 ${} just launched on SWOGE FUN — instantly on Uniswap & DexScreener! 🔒 LP locked, non-ruggable.".format(l["symbol"] or "TOKEN")
+    url  = "https://twitter.com/intent/tweet?text=" + urllib.parse.quote(text) + "&url=" + urllib.parse.quote(SITE_URL)
+    return {"inline_keyboard": [[{"text": "🐦 Tweet this", "url": url}]]}
 
 # ---------- announce one launch ----------
 def announce(l):
@@ -182,25 +196,87 @@ def announce(l):
     if socials: lines.append("🔗 " + " · ".join(socials))
     caption = "\n".join(lines)
 
+    kb = tweet_button(l)   # 🐦 Tweet-this button under the alert
     # try to attach the logo as a photo
     logo = l["logo"] or ""
     if not BOT_TOKEN or not CHAT_ID:
-        print("[dry-run]\n" + caption + ("\n(+logo)" if logo else "") + "\n"); return
+        print("[dry-run]\n" + caption + ("\n(+logo)" if logo else "") + "\n[🐦 Tweet button]\n"); return
     try:
         if logo.startswith("data:image") and ";base64," in logo:
             img = base64.b64decode(logo.split(";base64,", 1)[1])
-            if len(img) < 9_000_000 and tg_photo(img, caption): return
+            if len(img) < 9_000_000 and tg_photo(img, caption, kb): return
         elif logo.startswith("http"):
             body = json.dumps({"chat_id": CHAT_ID, "photo": logo, "caption": caption,
-                               "parse_mode": "HTML"}).encode()
+                               "parse_mode": "HTML", "reply_markup": kb}).encode()
             if tg_call("sendPhoto", body, {"content-type": "application/json"}): return
     except Exception as e:
         print("photo failed, sending text:", e)
-    tg_message(caption)   # fallback: text only
+    tg_message(caption, kb)   # fallback: text only
+
+# ---------- $SWOGE burns ----------
+def swoge_burns_in_range(frm, to):
+    dead_topic = "0x" + DEAD[2:].rjust(64, "0")
+    flt = {"fromBlock": hx(frm), "toBlock": hx(to), "address": SWOGE_TOKEN,
+           "topics": [TRANSFER, None, dead_topic]}   # Transfer(from, *, to=DEAD)
+    logs = rpc("eth_getLogs", [flt])
+    out = []
+    for l in sorted(logs, key=lambda x: (to_int(x["blockNumber"]), to_int(x.get("logIndex","0x0")))):
+        out.append({"from": addr_topic(l["topics"][1]),
+                    "amount": to_int(l["data"]) / 1e18,   # SWOGE is 18 decimals
+                    "tx": l["transactionHash"]})
+    return out
+
+def swoge_total_burned():
+    try:
+        r = rpc("eth_call", [{"to": SWOGE_TOKEN, "data": SEL_BALANCEOF + "0"*24 + DEAD[2:]}, "latest"])
+        return to_int(r) / 1e18
+    except Exception:
+        return None
+
+def announce_burn(b):
+    total = swoge_total_burned()
+    lines = [
+        "🔥🔥🔥 <b>$SWOGE BURN</b> 🔥🔥🔥",
+        "",
+        "🔥 Just burned: <b>{:,.0f} SWOGE</b>".format(b["amount"]),
+    ]
+    if total is not None:
+        lines.append("📊 Total burned: <b>{:,.0f} SWOGE</b>  ({:.3f}% of supply)".format(total, total/1e9*100))
+    lines.append("👤 <a href=\"{}/address/{}\">{}</a> · <a href=\"{}/tx/{}\">Tx ↗</a>".format(
+        SCAN, b["from"], short(b["from"]), SCAN, b["tx"]))
+    tg_message("\n".join(lines))
+
+# ---------- diagnostic: which chats can this bot see? ----------
+def discover_chats():
+    if not BOT_TOKEN:
+        return
+    try:
+        req = urllib.request.Request(TG + "/getUpdates", headers={"user-agent": UA})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            j = json.loads(r.read())
+        seen = {}
+        for u in j.get("result", []):
+            for key in ("message", "channel_post", "edited_message", "my_chat_member"):
+                m = u.get(key)
+                if m and m.get("chat"):
+                    c = m["chat"]
+                    seen[c["id"]] = "{} ({})".format(c.get("title") or c.get("username") or "?", c.get("type"))
+        print("Configured TELEGRAM_CHAT_ID = {!r}".format(CHAT_ID))
+        if seen:
+            print("--- Chats this bot can see (copy one of these ids) ---")
+            for cid, label in seen.items():
+                print("    TELEGRAM_CHAT_ID = {}   →  {}".format(cid, label))
+            print("------------------------------------------------------")
+        else:
+            print("This bot sees NO chats yet. Fix: add the bot to your group,")
+            print("turn Group Privacy OFF in @BotFather, POST a message IN the group, then redeploy.")
+    except Exception as e:
+        print("discover_chats error:", e)
 
 # ---------- main loop ----------
 def main():
     print("SWOGE FUN new-token bot starting…")
+    discover_chats()
     # resilient startup: keep retrying instead of crashing (so Railway doesn't restart-storm)
     tip = None
     while tip is None:
@@ -217,13 +293,15 @@ def main():
         except Exception as e:
             print("backlog skipped:", e)
     last = tip
-    print("Ready. Watching from block", last)
+    print("Ready. Watching new tokens + $SWOGE burns from block", last)
     while True:
         try:
             t = to_int(rpc("eth_blockNumber", []))
             if t > last:
                 for l in launches_in_range(last + 1, t):
                     announce(l); time.sleep(1)
+                for b in swoge_burns_in_range(last + 1, t):
+                    announce_burn(b); time.sleep(1)
                 last = t
         except Exception as ex:
             print("loop error:", ex)
