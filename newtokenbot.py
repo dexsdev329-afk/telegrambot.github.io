@@ -39,12 +39,22 @@ SEL_BALANCEOF = "0x70a08231"
 SEL_SUPPLY    = "0x18160ddd"
 import urllib.parse
 
+# ---------- buy watching (Uniswap Swap events on launchpad pools) ----------
+WETH   = "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73"
+WETH_L = WETH.lower()
+SWAP   = "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67"  # Swap(...)
+POOLS  = {}   # pool_addr(lower) -> {"token":.., "symbol":..}
+
 # ---------- user config ----------
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 SITE_URL  = os.environ.get("SITE_URL", "https://swoleeswoge.dog/launchpad.html").strip()
 POLL      = int(os.environ.get("POLL_SECONDS", "20"))
 BACKLOG   = os.environ.get("ANNOUNCE_BACKLOG", "0").strip() == "1"
+WATCH_BUYS        = os.environ.get("WATCH_BUYS", "1").strip() == "1"     # 🟢 buy alerts
+MIN_BUY_USD       = float(os.environ.get("MIN_BUY_USD", "1"))            # skip dust buys
+USD_PER_BUY_EMOJI = float(os.environ.get("USD_PER_BUY_EMOJI", "10"))
+BUY_EMOJI         = os.environ.get("BUY_EMOJI", "🟢")
 
 # ---------- JSON-RPC ----------
 # Some RPC providers (Cloudflare-fronted) reject the default "Python-urllib"
@@ -246,6 +256,80 @@ def announce_burn(b):
         SCAN, b["from"], short(b["from"]), SCAN, b["tx"]))
     tg_message("\n".join(lines))
 
+# ---------- 🟢 buys ----------
+_eth = {"v": None, "t": 0.0}
+def eth_usd():
+    if _eth["v"] and (time.time() - _eth["t"] < 120):
+        return _eth["v"]
+    for url, path in [("https://coins.llama.fi/prices/current/coingecko:ethereum", ("coins","coingecko:ethereum","price")),
+                      ("https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd", ("ethereum","usd"))]:
+        try:
+            req = urllib.request.Request(url, headers={"user-agent": UA})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                j = json.loads(r.read())
+            for k in path: j = j[k]
+            _eth["v"] = float(j); _eth["t"] = time.time(); return _eth["v"]
+        except Exception:
+            continue
+    return _eth["v"]
+
+def fmt_amt(n):
+    if n >= 1e9: return "{:.2f}B".format(n/1e9)
+    if n >= 1e6: return "{:.2f}M".format(n/1e6)
+    if n >= 1e3: return "{:.1f}K".format(n/1e3)
+    return "{:,.0f}".format(n)
+
+def sint(hexword):
+    v = int(hexword, 16)
+    return v - (1 << 256) if v >= (1 << 255) else v
+
+def build_pools(tip):
+    created  = get_logs(CREATED, 0, tip)
+    launched = get_logs(LAUNCHED, 0, tip)
+    sym = {}
+    for c in created:
+        sym[addr_topic(c["topics"][1]).lower()] = decode_dyn_str(c["data"], 1)  # symbol = 2nd string
+    for l in launched:
+        tk   = addr_topic(l["topics"][1])
+        pool = ("0x" + word(l["data"], 0)[-40:]).lower()
+        POOLS[pool] = {"token": tk, "symbol": sym.get(tk.lower(), "?")}
+
+def buys_in_range(frm, to):
+    if not POOLS: return []
+    flt = {"fromBlock": hx(frm), "toBlock": hx(to), "address": list(POOLS.keys()), "topics": [SWAP]}
+    logs = rpc("eth_getLogs", [flt])
+    out = []
+    for l in sorted(logs, key=lambda x: (to_int(x["blockNumber"]), to_int(x.get("logIndex","0x0")))):
+        info = POOLS.get(l["address"].lower())
+        if not info: continue
+        d = l["data"]; a0 = sint(d[2:66]); a1 = sint(d[66:130])
+        t0w = WETH_L < info["token"].lower()
+        wdelta = a0 if t0w else a1       # WETH delta for the pool
+        tdelta = a1 if t0w else a0
+        if wdelta <= 0: continue          # only buys (WETH flowing INTO the pool)
+        out.append({"symbol": info["symbol"], "pool": l["address"],
+                    "eth": wdelta/1e18, "tokens": abs(tdelta)/1e18,
+                    "who": addr_topic(l["topics"][2]), "tx": l["transactionHash"]})
+    return out
+
+def announce_buy(b):
+    price = eth_usd()
+    usd = b["eth"] * price if price else None
+    if usd is not None and usd < MIN_BUY_USD:
+        return
+    sym = html.escape(b["symbol"] or "?")[:24]
+    n_em = max(1, min(50, int(usd // USD_PER_BUY_EMOJI) + 1)) if usd else 1
+    lines = [
+        BUY_EMOJI * n_em,
+        "<b>${} Buy!</b>".format(sym),
+        "",
+        "💵 <b>{}</b>  ({:.4f} ETH)".format(("$%.2f" % usd) if usd else ("%.4f ETH" % b["eth"]), b["eth"]),
+        "🪙 {} {}".format(fmt_amt(b["tokens"]), sym),
+        "👤 <a href=\"{}/address/{}\">{}</a>".format(SCAN, b["who"], short(b["who"])),
+        "📊 <a href=\"{}/{}\">DexScreener</a> · <a href=\"{}/tx/{}\">Tx ↗</a>".format(DEX, b["pool"], SCAN, b["tx"]),
+    ]
+    tg_message("\n".join(lines))
+
 # ---------- diagnostic: which chats can this bot see? ----------
 def discover_chats():
     if not BOT_TOKEN:
@@ -284,6 +368,11 @@ def main():
             tip = to_int(rpc("eth_blockNumber", []))
         except Exception as e:
             print("startup: RPC not ready ({}), retrying in 15s…".format(e)); time.sleep(15)
+    if WATCH_BUYS:
+        try:
+            build_pools(tip); print("tracking {} pools for buy alerts".format(len(POOLS)))
+        except Exception as e:
+            print("pool scan skipped:", e)
     if BACKLOG:
         try:
             start = max(0, tip - 500000)
@@ -293,15 +382,20 @@ def main():
         except Exception as e:
             print("backlog skipped:", e)
     last = tip
-    print("Ready. Watching new tokens + $SWOGE burns from block", last)
+    print("Ready. Watching new tokens + $SWOGE burns" + (" + 🟢 buys" if WATCH_BUYS else "") + " from block", last)
     while True:
         try:
             t = to_int(rpc("eth_blockNumber", []))
             if t > last:
                 for l in launches_in_range(last + 1, t):
-                    announce(l); time.sleep(1)
+                    announce(l)
+                    if l.get("pool"): POOLS[l["pool"].lower()] = {"token": l["token"], "symbol": l["symbol"]}
+                    time.sleep(1)
                 for b in swoge_burns_in_range(last + 1, t):
                     announce_burn(b); time.sleep(1)
+                if WATCH_BUYS:
+                    for bu in buys_in_range(last + 1, t):
+                        announce_buy(bu); time.sleep(1)
                 last = t
         except Exception as ex:
             print("loop error:", ex)
