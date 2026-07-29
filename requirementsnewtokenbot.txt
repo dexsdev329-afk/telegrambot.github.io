@@ -1,0 +1,1 @@
+# SWOGE FUN new-token bot uses only the Python standard library — no dependencies.
